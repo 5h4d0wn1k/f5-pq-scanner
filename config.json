@@ -1,0 +1,7 @@
+{
+  "thresholds": {
+    "rsa_min_bits": 3072,
+    "ecc_min_bits": 256,
+    "dh_min_group_bits": 2048
+  }
+}

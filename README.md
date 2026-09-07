@@ -1,102 +1,115 @@
-# F5 — Post-quantum readiness scanner
+# F5 — Post-Quantum Crypto Scanner
 
-Inventories weak-in-2035 cryptography (RSA/ECDSA/ECDH) and grades the estate against seven government migration timelines with a Quantum Readiness Score.
+A deterministic, offline, standard-library-only scanner that inspects
+**key-exchange configurations** and **TLS/SSH transcript representations** and
+flags anything weaker than NIST post-quantum migration thresholds.
 
 ## Overview
 
-- **Weak-in-2035 crypto inventory**: Static source scan for RSA/ECDSA/ECDH usage with key-size detection across config/env/bundle files from an embedded sample tree
-- **Cipher-probe output parser**: Consumes TLS/SSH handshake/test output naming ciphers and curves (x25519, secp256r1, RSA2048, X25519MLKEM768) and maps each to quantum robustness
-- **CBOM JSON**: Emits a CycloneDX-ish Cryptographic Bill of Materials enumerating weak components
-- **Framework grading**: Scores readiness against seven frameworks' timelines (CNSA 2.0, NIST IR 8547, BSI, NCSC, ASD, ANSSI, KCMSP) producing a framework-divergence table
-- **Fully offline**: Runs against an embedded sample "codebase" and canned probe output
+- **Thresholds documented**: RSA < 3072 is weak; ECDH/ECDSA curves < 256 bits
+  are weak; classical DH groups < 2048 bits are weak; TLS 1.2 without a hybrid
+  PQC suite is weak. Source: NIST IR 8547 / IETF hybrid key-share direction.
+- **Config inspection** — parses synthetic asset configs (cert key algorithm +
+  size, KEX algorithm + curve/group, TLS version, SSH kex/host-key).
+- **Transcript inspection** — parses canned `openssl s_client`/SSH output text
+  and detects negotiated TLS 1.2, classical-only suites, weak DH groups,
+  ssh-rsa host keys, and **hybrid PQC** agreements (`X25519MLKEM768`).
+- **Quantum Readiness Score** — 0–100, deducting per weak asset.
+- Clean exit codes: `0` = successful run, `1` = weak crypto present with
+  `--strict` (gate mode), `2` = config error. The default demo run always exits
+  `0`. Reports to `reports/` (Markdown or JSON), gitignored.
 
-## Features
-
-- **Static source scan** for `RSA`, `ECDSA`, `ECDH`, curves `secp256r1`/`P-256`/`P-384`
-- **Key-size detection** (1024/2048/3072/4096) tagged with the year they become quantum-tractable
-- **Cipher-probe parser** that classifies negotiated suites as weak / hybrid / compliant
-- **Hybrid PQC detection** for ML-KEM/Kyber/sntrup combined suites (e.g. `X25519MLKEM768`)
-- **CycloneDX 1.5 CBOM** output with per-asset weak-by-2035 properties
-- **Seven-framework divergence table** with clear migrate-by deadlines
-- **Quantum Readiness Score** (0-100)
-
-## Installation
+## CLI
 
 ```bash
-# No third-party dependencies. Python 3.8+ standard library only.
-pip install -r requirements.txt   # (empty; nothing required)
-```
-
-## Usage
-
-```python
-from pq_scanner import parse_probe_output, scan_source_tree, grade_frameworks, build_cbom
-
-findings = scan_source_tree("path/to/source")
-entries = parse_probe_output(probe_text)
-rows, score = grade_frameworks(findings, entries)
-cbom = build_cbom(findings, entries, rows)
-```
-
-### Running the Demo
-
-```bash
+python3 firmware/pq_scanner.py --help
 python3 firmware/pq_scanner.py
+python3 firmware/pq_scanner.py --config-file assets.json --report reports/r.md
+python3 firmware/pq_scanner.py --transcript-file tls.log --report reports/r.json
 ```
 
-## Example Output
+Config lives in `config.json` (thresholds). All scans run against synthetic
+fixtures or files you supply; nothing ever queries a live network.
 
-```
-============================================================
-  F5 — Post-quantum readiness scanner
-============================================================
+## Tests
 
-[1/4] Static source scan (RSA/ECDSA/ECDH, key-size detection) ...
-  findings: 7
-  by kind : {'rsa': 3, 'ecc': 3, 'key_size': 1}
-[2/4] TLS/SSH cipher-probe output parser ...
-  TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256   -> weak (classically-weak)
-  KEX: X25519MLKEM768                     -> hybrid (PQC + classically-weak)
-[3/4] Framework timeline grading (7 frameworks)...
-  Quantum Readiness Score: 25/100
+```bash
+python3 -m unittest discover -s tests -v
 ```
 
 ## IMPORTANT: Read before use.
 
-This project is provided for **educational and authorized security testing purposes only**.
+Provided **exclusively** for authorized security research, academic study, and
+readiness assessment of systems you own or are authorized to assess.
 
 ### Authorization Requirements
-- You MUST have explicit written permission before scanning an organization's cryptographic estate
-- Unauthorized scanning of systems or network service cipher suites may violate computer fraud laws
-- This tool should ONLY be used on systems you own or have written authorization to assess
+
+You MUST have explicit written permission before scanning any organization's
+cryptographic estate. This tool inspects config files and canned transcripts
+only; do not point it at systems you do not own or lack written authorization
+to assess.
 
 ### Legal Framework
-- **Computer Fraud and Abuse Act (CFAA)**: Unauthorized access to computer systems is a federal crime
-- **Penetration Testing / Security Research Laws**: Some jurisdictions exempt authorized security research; others do not
-- **State Laws**: Many states have additional computer crime statutes
-- **Contractual Terms**: Scanning may breach acceptable-use policies or software license terms
+
+Unauthorized access to or interference with computer systems is governed by the
+**Computer Fraud and Abuse Act (CFAA)** (18 U.S.C. § 1030), the **EU Directive
+on Attacks Against Information Systems** (2013/40/EU), and equivalent
+legislation in other jurisdictions. Penalties include imprisonment and
+significant fines. Some jurisdictions exempt authorized security research, but
+that must still be documented and scoped.
 
 ### Acceptable Use
-- Assessing the cryptographic posture of your own systems
+
+- Assessing the cryptographic posture of your own systems and configurations
 - Authorized readiness assessments with a written scope and budget
 - Academic research in controlled lab environments
-- Security education and training
+- Security education and training (fixtures use only RFC 5737/doc names)
 
 ### Prohibited Use
+
 - Scanning systems you do not own without authorization
+- Probing live endpoints or networks with this scanner
 - Using output to access or exfiltrate data beyond the assessment scope
-- Any activity that violates applicable laws or regulations
 - Facilitating unauthorized penetration of third-party infrastructure
 
 ### No Warranty
-This software is provided "AS IS" without warranty of any kind. The author is not responsible for any misuse or damage caused by this software.
+
+This software is provided "as is" without warranty of any kind. The authors
+assume no liability for damages arising from use or misuse of this tool,
+including incorrect cryptographic classification against evolving standards.
 
 ### Responsible Disclosure
-If you discover cryptographic weaknesses using this tool, follow responsible disclosure practices:
-1. Report to the system owner privately
-2. Allow reasonable time for remediation
-3. Do not exploit beyond proof of concept
+
+If you discover cryptographic weaknesses using this tool, follow coordinated
+disclosure: report privately to the system owner, allow reasonable time for
+remediation, and do not exploit beyond proof of concept.
+
+## Live Lab Test Plan
+
+1. **Demo run** — `python3 firmware/pq_scanner.py` scans 4 assets + 5
+   transcripts, prints the banner and findings, writes the report, and exits `0`.
+2. **Gate mode** — `--strict` exits `1` because weak crypto is present.
+2. **Threshold sanity** — `rsa_bits_to_security(1024) < 100 < 128 <=
+   rsa_bits_to_security(3072)` (unit-tested).
+3. **Hybrid detection** — the gateway fixture's `X25519MLKEM768` appears as
+   `hybrid_pqc` / `transcript_pqc_hybrid`, never flagged weak.
+4. **Honest partial** — the same gateway is flagged for its RSA-2048
+   certificate (below the 3072 threshold) — no false "all clean".
+5. **Determinism** — identical fixture run yields identical findings.
+6. **Offline guarantee** — stdlib only; no network; fixed fixtures + RFC 5737.
+
+## Metrics
+
+| Metric | Definition |
+|--------|-----------|
+| Assets scanned | fixtures or `--config-file` entries |
+| Findings | total issues, split weak vs informative (hybrid PQC) |
+| Weak types | rsa_key_size / tls_version / dh_short_group / ecc_short_curve / ssh_* / transcript_* |
+| Quantum Readiness Score | 100 − 25 × (distinct weak assets), floor 0 |
+| Exit codes | 0 successful demo, 1 weak findings in --strict mode, 2 config error |
+
+Verified offline: 4 assets → 15 findings (13 weak), readiness score 0/100.
 
 ## License
 
-MIT
+MIT License

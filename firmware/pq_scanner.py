@@ -1,360 +1,300 @@
 #!/usr/bin/env python3
 """
-F5 — Post-quantum readiness scanner
-Inventories weak-in-2035 cryptography (RSA/ECDSA/ECDH) across source trees,
-parses TLS/SSH cipher-probe output, emits a CycloneDX-ish CBOM JSON, and grades
-the estate against seven government/framework migration timelines, producing a
-framework-divergence table and a Quantum Readiness Score.
+F5 — Post-quantum cryptography scanner.
 
-Educational / authorized use only. See README legal section.
+Inspects key-exchange configurations and TLS/SSH transcript representations and
+flags any cryptography weaker than NIST post-quantum migration thresholds
+(RSA < 3072, ECDH/ECDSA on curves < 256 bits, classical DH groups < 2048, DH on
+*any* TLS 1.2 suite, TLS 1.2-without-PQC-hybrid).
 
-Usage:
-    python3 pq_scanner.py            # run the offline self-test demo (exit 0)
+Runs queries against synthetic fixture configs (never a live network) and
+produces JSON/Markdown findings plus a Quantum Readiness Score (0-100). Fully
+offline and deterministic - standard library only.
 """
 
-import hashlib
+from __future__ import annotations
+
+import argparse
 import json
-import os
 import re
 import sys
-from collections import defaultdict, Counter
+from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Static source scanning: patterns that reveal weak-in-2035 algorithm usage
-# ---------------------------------------------------------------------------
-
-RSA_RE = re.compile(r"\bRSA(?:/)?(?:OAEP|PSS|PKCS1|SHA\d{3})?\b", re.IGNORECASE)
-ECDSA_RE = re.compile(r"\b(?:ECDSA|ECDH|secp256r1|secp384r1|P-256|P-384)\b", re.IGNORECASE)
-KEY_LEN_RE = re.compile(r"\b(?:RSA|bits|key_size|key_length)\s*[=:]\s*(\d{4})", re.IGNORECASE)
-
-# Approximate year each key length / curve becomes tractable for a quantum
-# adversary (Shor's algorithm). Used for the weak-by-2035 cutoff.
-GENERIC_BITS_YEAR = {
-    1024: 2020,
-    2048: 2030,
-    3072: 2035,
-    4096: 2040,
+# --------------------------------------------------------------------------- #
+# NIST PQC migration thresholds (documented; 3.1.1-era informative).
+# --------------------------------------------------------------------------- #
+THRESHOLDS = {
+    "rsa_min_bits": 3072,           # AES-128-equivalent security
+    "ecc_min_bits": 256,            # curves below 256 bits are weak
+    "dh_min_group_bits": 2048,      # classical finite-field groups
+    "tls_min_version_ok": "1.3",    # TLS 1.2 without hybrid is a finding
 }
 
 
-def scan_source_tree(root, file_exts=(".py", ".c", ".h", ".cpp", ".hpp", ".go", ".rs", ".js", ".conf", ".json", ".env")):
-    """Walk an embedded sample tree and collect crypto-usage findings."""
+# --------------------------------------------------------------------------- #
+# Synthetic fixture configs + TLS/SSH transcript representations.
+# --------------------------------------------------------------------------- #
+FIXTURES = {
+    "web-api": {
+        "tls_version": "1.2",
+        "cert": {"key_alg": "RSA", "key_bits": 1024, "subject": "api.example.com"},
+        "key_exchange": {"algo": "ECDHE_RSA", "curve": "secp521r1"},
+        "cipher": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    },
+    "gateway": {
+        "tls_version": "1.3",
+        "cert": {"key_alg": "RSA", "key_bits": 2048, "subject": "gw.example.com"},
+        "key_exchange": {"algo": "X25519MLKEM768", "curve": "x25519"},
+        "cipher": "TLS_AES_256_GCM_SHA384",
+    },
+    "legacy-vpn": {
+        "tls_version": "1.2",
+        "cert": {"key_alg": "RSA", "key_bits": 1024, "subject": "vpn.example.com"},
+        "key_exchange": {"algo": "DH", "group_bits": 1024, "curve": None},
+        "cipher": "TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
+    },
+    "ssh-gateway": {
+        "ssh": True,
+        "kex": "diffie-hellman-group14-sha256",   # 2048-bit group (borderline)
+        "host_key_alg": "ssh-rsa",
+        "host_key_bits": 4096,
+    },
+}
+
+# TLS transcript representation: extraction of `openssl s_client ... | grep Cipher`
+TLS_TRANSCRIPTS = {
+    "web-api": "New, TLSv1.2, Cipher is TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "gateway": "New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384\n"
+               "Server Temp Key: X25519MLKEM768 3072 bits",
+    "legacy-vpn": "New, TLSv1.2, Cipher is TLS_DHE_RSA_WITH_AES_256_CBC_SHA",
+}
+
+SSH_TRANSCRIPTS = {
+    "ssh-gateway": "kex_algorithm: diffie-hellman-group14-sha256\n"
+                   "server_host_key_algorithms: ssh-rsa\n",
+}
+
+# --------------------------------------------------------------------------- #
+# Cost heuristics: attack complexity in ~bits of security for the crypto under
+# migration. Post-quantum: large classical RSA/DH and short curves are the
+# headline flags.
+# --------------------------------------------------------------------------- #
+def rsa_bits_to_security(bits):
+    """Approximate classical security (bits) for RSA modulus size.
+
+    Documented anchor points (ECRYPT-CSA / NIST-equivalent estimates):
+      1024 -> ~80, 2048 -> ~112, 3072 -> ~128, 4096 -> ~140.
+    """
+    anchors = [(1024, 80), (2048, 112), (3072, 128), (4096, 140)]
+    if bits <= anchors[0][0]:
+        return int(bits / 1024 * anchors[0][1])
+    for (a, sa), (b, sb) in zip(anchors, anchors[1:]):
+        if a <= bits <= b:
+            frac = (bits - a) / (b - a)
+            return int(sa + frac * (sb - sa))
+    return int(anchors[-1][1] + (bits - anchors[-1][0]) / 10)
+
+
+def ecc_curve_security(bits):
+    return int(bits / 2)
+
+
+def classify_weak(conf, name):
+    """Return list of finding dicts for one config."""
     findings = []
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for fn in filenames:
-            if not any(fn.endswith(e) for e in file_exts):
-                continue
-            path = os.path.join(dirpath, fn)
-            try:
-                with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                    lines = fh.readlines()
-            except OSError:
-                continue
-            for idx, line in enumerate(lines, 1):
-                low = line.lower()
-                if "rsa" in low:
-                    findings.append(_finding(path, idx, "rsa", "RSA/public-key (Shor-vulnerable)", line))
-                if "ecdsa" in low or "ecdh" in low or "secp256r1" in low or "secp384r1" in low:
-                    findings.append(_finding(path, idx, "ecc", "ECDSA/ECDH on non-PQC curve", line))
-                for bits, year in GENERIC_BITS_YEAR.items():
-                    if f"{bits}" in low and year <= 2035:
-                        findings.append(_finding(path, idx, "key_size", f"{bits}-bit key (weak-by-{year})", line))
+    src = "config"
+
+    tls_ver = conf.get("tls_version")
+    if tls_ver and tls_ver < "1.3":
+        findings.append({
+            "asset": name, "type": "tls_version",
+            "detail": "TLS %s in use; migrate to TLS 1.3 or add hybrid PQC"
+                      % tls_ver,
+            "weak": True})
+
+    cert = conf.get("cert") or {}
+    key_alg = cert.get("key_alg", "")
+    key_bits = cert.get("key_bits")
+    if key_alg.upper() == "RSA" and key_bits:
+        if key_bits < THRESHOLDS["rsa_min_bits"]:
+            findings.append({
+                "asset": name, "type": "rsa_key_size",
+                "detail": "RSA-%d < NIST threshold RSA-%d"
+                          % (key_bits, THRESHOLDS["rsa_min_bits"]),
+                "weak": True})
+
+    kex = conf.get("key_exchange") or {}
+    curve = kex.get("curve")
+    group_bits = kex.get("group_bits")
+    algo = kex.get("algo", "")
+    if "X25519MLKEM" in algo or "MLKEM" in algo or "kyber" in algo.lower():
+        findings.append({"asset": name, "type": "hybrid_pqc",
+                         "detail": algo + " hybrid present", "weak": False})
+    if curve and curve not in ("x25519",) and "PQC" not in algo:
+        m = re.search(r"(\d+)", curve)
+        if m and m.group(1).startswith("521"):
+            pass  # secp521r1 is fine
+        bits = int(m.group(1)) if m else 0
+        if 0 < bits < THRESHOLDS["ecc_min_bits"]:
+            findings.append({
+                "asset": name, "type": "ecc_short_curve",
+                "detail": "curve %s ≈ %d-bit security < 128-bit PQC target" %
+                          (curve, bits // 2), "weak": True})
+    if group_bits and group_bits < THRESHOLDS["dh_min_group_bits"]:
+        findings.append({
+            "asset": name, "type": "dh_short_group",
+            "detail": "DH group %d < %d bits" %
+                      (group_bits, THRESHOLDS["dh_min_group_bits"]),
+            "weak": True})
+
+    # SSH representation
+    if conf.get("ssh"):
+        kex_name = conf.get("kex", "")
+        if "group14" in kex_name or "group1" in kex_name:
+            g = int(re.search(r"group\d+", kex_name).group(0).lstrip("group"))
+            if g < THRESHOLDS["rsa_min_bits"]:
+                findings.append({
+                    "asset": name, "type": "ssh_short_dh_group",
+                    "detail": kex_name + " group %d < NIST threshold" % g,
+                    "weak": True})
+        hk = conf.get("host_key_alg", "")
+        if hk == "ssh-rsa" and conf.get("host_key_bits", 0) < THRESHOLDS["rsa_min_bits"]:
+            findings.append({
+                "asset": name, "type": "ssh_rsa_key_size",
+                "detail": "ssh-rsa host key %d bits" % conf["host_key_bits"],
+                "weak": True})
+        if "rsa" in hk.lower() and "509" in hk:
+            findings.append({
+                "asset": name, "type": "ssh_cert_delegation",
+                "detail": hk, "weak": False})
+
     return findings
 
 
-def _finding(path, line_no, kind, desc, snippet):
-    return {
-        "file": os.path.relpath(path),
-        "line": line_no,
-        "kind": kind,
-        "description": desc,
-        "weak_by_2035": True,
-        "sha256_of_line": hashlib.sha256(snippet.strip().encode("utf-8", "replace")).hexdigest()[:16],
-    }
+def classify_transcript(text, name):
+    """Inspect a TLS/SSH transcript representation for weak negotiations."""
+    findings = []
+    m_tls = re.search(r"TLSv1\.(\d)", text)
+    if m_tls and m_tls.group(0).endswith("2"):
+        findings.append({
+            "asset": name, "type": "transcript_tls12",
+            "detail": "transcript negotiated TLS 1.2", "weak": True})
+    for suite in re.findall(r"TLS_[A-Z0-9_]+", text):
+        if "DHE" in suite or "RSA" in suite and "ECDHE_RSA" in suite:
+            if "MLKEM" not in text and "KYBER" not in text.upper():
+                findings.append({
+                    "asset": name, "type": "transcript_classical_only",
+                    "detail": suite, "weak": True})
+    m_kex = re.search(r"X25519MLKEM(\d+)", text)
+    if m_kex:
+        findings.append({"asset": name, "type": "transcript_pqc_hybrid",
+                         "detail": "X25519MLKEM%s hybrid" % m_kex.group(1),
+                         "weak": False})
+
+    m_ssh_kex = re.search(r"kex_algorithm:\s*(\S+)", text)
+    if m_ssh_kex:
+        kex = m_ssh_kex.group(1)
+        g = re.search(r"group(\d+)", kex)
+        if g and int(g.group(1)) < THRESHOLDS["dh_min_group_bits"]:
+            findings.append({
+                "asset": name, "type": "transcript_ssh_short_group",
+                "detail": kex, "weak": True})
+    m_hk = re.search(r"server_host_key_algorithms:\s*(\S+)", text)
+    if m_hk and "rsa" in m_hk.group(1):
+        findings.append({
+            "asset": name, "type": "transcript_ssh_hostkey",
+            "detail": m_hk.group(1), "weak": True})
+    return findings
 
 
-# ---------------------------------------------------------------------------
-# TLS/SSH cipher-probe output parser
-# ---------------------------------------------------------------------------
-#
-# Consumes the text a client like `openssl s_client` / `ssh -Q kex` would emit:
-#   TLS_AES_128_GCM_SHA256          TLSv1.3 Kx=any  Au=any    Enc=AESGCM(128)
-#   TLS_ECDHE_RSA_WITH_AES_GCM_SHA256  TLSv1.2 Kx=ECDH  Au=RSA  Enc=AESGCM(128)
-#   KEX: sntrup761x25519-sha512
-#   KEX: curve25519-sha256
-# and maps each negotiated suite/cipher/curve to its quantum robustness.
-
-KNOWN_WEAK_TOKEN = ["rsa", "ecdsa", "ecdh", "secp256", "p-256", "p-384", "p-521", "curve25519", "x25519", "nistp"]
-
-# Curve name -> weak? (all elliptic curves used for key exchange are broken by
-# Shor's algorithm unless ML-KEM/other PQC is combined with them).
-CURVE_WEAK = {
-    "secp256r1": True, "secp384r1": True, "secp521r1": True,
-    "prime256v1": True, "x25519": True, "curve25519": True,
-    "x448": True, "curve448": True,
-}
-# Composite / hybrid PQC offerings that are acceptable heading toward 2035.
-PQC_TOKENS = ["mlkem", "kyber", "sntrup", "frodo", "classic-mceliece", "x25519mlkem768", "p256_kyber", "mlkem768x25519"]
+def scan(configs, transcripts, ssh_transcripts):
+    findings = []
+    for name, conf in configs.items():
+        findings.extend(classify_weak(conf, name))
+    for name, text in transcripts.items():
+        findings.extend(classify_transcript(text, name))
+    for name, text in ssh_transcripts.items():
+        findings.extend(classify_transcript(text, name))
+    return findings
 
 
-def parse_probe_output(text, source="embedded-probe.txt"):
-    """Parse cipher-probe text into a structured list of negotiated entries."""
-    entries = []
-    seen = set()
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        low = line.lower()
+# --------------------------------------------------------------------------- #
+# Readiness scoring + report.
+# --------------------------------------------------------------------------- #
+def quantum_readiness_score(findings, total=100):
+    """Score 0-100; weak findings deduct against a clean baseline."""
+    weak = [f for f in findings if f["weak"]]
+    deduction = min(100, 25 * len({f["asset"] for f in weak}))
+    return max(0, total - deduction)
 
-        if low.startswith("kx:") or re.match(r"^\s*(tls|sslv[23]|x25519|curve|secp|aes|chacha|mlkem|kyber)", low):
-            entries.append(_classify_probe_line(line, source))
-
-        # openssl s_client style lines that contain cipher + Kx= + Au= + Enc=
-        elif "kx=" in low or "au=" in low:
-            entries.append(_classify_probe_line(line, source))
-    # de-duplicate by normalized line
-    uniq = []
-    for e in entries:
-        key = (e["line"],)
-        if key not in seen:
-            seen.add(key)
-            uniq.append(e)
-    return uniq
-
-
-def _classify_probe_line(line, source):
-    low = line.lower()
-    weak = False
-    pqc = False
-    detail = "unknown"
-    for t in PQC_TOKENS:
-        if t in low:
-            pqc = True
-    for t in KNOWN_WEAK_TOKEN:
-        if t in low:
-            weak = True
-    if any(c in low for c in ["aesgcm", "chacha20", "sha256", "sha384", "tls1.3", "tls1.2", "tls1.3"]):
-        detail = "bulk-encryption/suite"
-    if weak and pqc:
-        detail = "hybrid (PQC + classically-weak)"
-    elif pqc:
-        detail = "pure-PQC"
-    elif weak:
-        detail = "classically-weak (Shor-vulnerable)"
-    status = "compliant" if (pqc and not weak) else "hybrid" if (pqc and weak) else "weak"
-    return {
-        "source": source,
-        "line": line,
-        "weak": weak,
-        "pqc": pqc,
-        "detail": detail,
-        "status": status,
-        "recommend": "replace-with-ML-KEM" if status == "weak" else "monitor" if status == "hybrid" else "ok",
-    }
-
-
-# ---------------------------------------------------------------------------
-# Framework migration timelines (timelines for when crypto must be migrated)
-# ---------------------------------------------------------------------------
-
-FRAMEWORKS = {
-    "CNSA 2.0 (US NSA)":        {"software-2035": True, "deploy_by": 2035, "target": "ML-KEM/ML-DSA"},
-    "NIST IR 8547 (US)":        {"software-2035": True, "deploy_by": 2035, "target": "PQC standalone"},
-    "BSI (Germany)":            {"software-2035": True, "deploy_by": 2030, "target": "hybrid optional"},
-    "NCSC (UK)":                {"software-2035": True, "deploy_by": 2033, "target": "hybrid/standard"},
-    "ASD (Australia)":          {"software-2035": True, "deploy_by": 2030, "target": "PQC hybrid"},
-    "ANSSI (France)":           {"software-2035": True, "deploy_by": 2035, "target": "PQC (2025-2030 first)"},
-    "KCMSP (S. Korea KISA)":    {"software-2035": True, "deploy_by": 2030, "target": "KCMSP with PQC"},
-}
-
-# The extra "one more" beyond the six named is KCMSP (Korea KISA). CNSA 2.0,
-# NIST IR 8547, BSI, NCSC, ASD, ANSSI are the other six.
-
-
-def grade_frameworks(findings, probe_entries):
-    """Produce per-framework readiness status + a divergence table."""
-    total_weak = len(findings) + sum(1 for p in probe_entries if p["status"] == "weak")
-    overall = _readiness_grade(total_weak)
-    rows = []
-    for name, spec in FRAMEWORKS.items():
-        compliant = total_weak == 0
-        status = "compliant" if compliant else "at-risk"
-        rows.append({
-            "framework": name,
-            "deploy_by": spec["deploy_by"],
-            "target": spec["target"],
-            "weak_assets": total_weak,
-            "status": status,
-            "migrate_required": spec["deploy_by"] <= 2035,
-        })
-    return rows, overall
-
-
-def _readiness_grade(weak_count):
-    if weak_count == 0:
-        return 100
-    if weak_count <= 2:
-        return 75
-    if weak_count <= 5:
-        return 50
-    return 25
-
-
-# ---------------------------------------------------------------------------
-# CycloneDX-ish CBOM JSON builder
-# ---------------------------------------------------------------------------
-
-def build_cbom(findings, probe_entries, framework_rows):
-    weak_components = []
-    for f in findings:
-        weak_components.append({
-            "type": "cryptographic-asset",
-            "name": f["file"],
-            "bom-ref": f"crypto-{f['sha256_of_line']}",
-            "description": f["description"],
-            "properties": [{"name": "weak-by-2035", "value": "true"}],
-        })
-    for p in probe_entries:
-        if p["status"] == "weak":
-            weak_components.append({
-                "type": "cryptographic-asset",
-                "name": p["line"],
-                "description": p["detail"],
-                "properties": [{"name": "status", "value": p["status"]}],
-            })
-    return {
-        "bomFormat": "CycloneDX",
-        "specVersion": "1.5",
-        "serialNumber": "urn:uuid:f5pq-scan-" + hashlib.sha1(str(len(findings)).encode()).hexdigest()[:8],
-        "metadata": {"component": {"type": "application", "name": "f5-pq-scanner", "version": "1.0"}},
-        "components": weak_components,
-        "services": [],
-        "quantumReadiness": {
-            "score": _readiness_grade(len(findings) + sum(1 for p in probe_entries if p["status"] == "weak")),
-            "frameworks": framework_rows,
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# EMBEDDED SAMPLE DATA (offline demo tree + probe output)
-# ---------------------------------------------------------------------------
-
-SAMPLE_TREE = {
-    "service-auth": {
-        "auth.go": [
-            "func login() error {\n",
-            "    // RSA2048 used for session ticket signing\n",
-            "    key, _ := rsa.GenerateKey(rand.Reader, 2048)\n",
-            "    sig, _ := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, digest)\n",
-            "}\n",
-        ],
-        "config.json": [
-            "{\n",
-            '  "tls": {"cert":"server.crt", "key_size": 2048, "curve":"secp256r1"},\n',
-            "}\n",
-        ],
-    },
-    "edge-proxy": {
-        "crypto.c": [
-            "/* ECDHE handshake, P-256 */\n",
-            "EC_KEY *key = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);\n",
-            "/* hash for signature */\n",
-        ],
-        "proxy.go": [
-            "package edge\n",
-            "// RSA-1024 legacy fallback retained for old clients\n",
-            "func legacy() { tls.Config{CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256}} }\n",
-        ],
-    },
-    "device-agent": {
-        "agent.py": [
-            "import ssl\n",
-            "# BLE transport uses ECDH (P-384) for session establishment\n",
-            "curve = ssl.ECDH_AUTO\n",
-        ],
-        ".env": [
-            "PAYLOAD_ENCRYPTION=rsa\n",
-            "KEY_BITS=3072\n",
-        ],
-    },
-}
-
-PROBE_OUTPUT = """\
-TLS_AES_128_GCM_SHA256                    TLSv1.3 Kx=any      Au=any    Enc=AESGCM(128)  Mac=AEAD
-TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256     TLSv1.2 Kx=ECDH     Au=RSA    Enc=AESGCM(128)  Mac=AEAD
-TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256   TLSv1.2 Kx=ECDH     Au=ECDSA  Enc=AESGCM(128)  Mac=AEAD
-KEX: curve25519-sha256
-KEX: sntrup761x25519-sha512
-KEX: X25519MLKEM768
-"""
-
-
-def _materialize_tree(root):
-    """Write the embedded sample tree to disk so the scanner can walk it."""
-    os.makedirs(root, exist_ok=True)
-    for sub, files in SAMPLE_TREE.items():
-        d = os.path.join(root, sub)
-        os.makedirs(d, exist_ok=True)
-        for fn, lines in files.items():
-            with open(os.path.join(d, fn), "w", encoding="utf-8") as fh:
-                fh.writelines(lines)
-
-
-# ---------------------------------------------------------------------------
-# Demo / self-test
-# ---------------------------------------------------------------------------
 
 def main(argv=None):
-    print("=" * 60)
-    print("  F5 — Post-quantum readiness scanner")
-    print("=" * 60)
+    ap = argparse.ArgumentParser(
+        prog="f5-pq-scanner",
+        description="Post-quantum scanner: inspection of key-exchange configs "
+                    "and TLS/SSH transcript representations, flagging anything "
+                    "weaker than NIST PQC migration thresholds.",
+    )
+    ap.add_argument("--config-file", default=None,
+                    help="path to a JSON config of assets to scan (overrides "
+                         "embedded fixture set)")
+    ap.add_argument("--transcript-file", default=None,
+                    help="path to a TLS transcript text to scan")
+    ap.add_argument("--config", default="config.json")
+    ap.add_argument("--report", default="reports/report.md")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit 1 when weak crypto is present (gate mode)")
+    ap.add_argument("--verbose", "-v", action="store_true")
+    args = ap.parse_args(argv)
 
-    import tempfile
-    workdir = tempfile.mkdtemp(prefix="f5-pq-")
-    tree_root = os.path.join(workdir, "codebase")
-    _materialize_tree(tree_root)
+    cfg = {}
+    cfg_path = Path(args.config)
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError:
+            print("[config] parse error in %s" % cfg_path, file=sys.stderr)
+            return 2
 
-    print("\n[1/4] Static source scan (RSA/ECDSA/ECDH, key-size detection) ...")
-    findings = scan_source_tree(tree_root)
-    print(f"  findings: {len(findings)}")
-    by_kind = Counter(f["kind"] for f in findings)
-    print(f"  by kind : {dict(by_kind)}")
-    for f in findings[:5]:
-        print(f"    - {f['file']}:{f['line']}  [{f['description']}]")
+    if args.config_file:
+        configs = json.loads(Path(args.config_file).read_text())
+    else:
+        configs = FIXTURES
+    transcripts = dict(TLS_TRANSCRIPTS)
+    ssh_transcripts = dict(SSH_TRANSCRIPTS)
+    if args.transcript_file:
+        transcripts["cli_transcript"] = Path(args.transcript_file).read_text()
 
-    print("\n[2/4] TLS/SSH cipher-probe output parser ...")
-    entries = parse_probe_output(PROBE_OUTPUT)
-    print(f"  negotiated entries: {len(entries)}")
-    for e in entries:
-        print(f"    - {e['line']:<60} -> {e['status']} ({e['detail']})")
+    findings = scan(configs, transcripts, ssh_transcripts)
+    weak = [f for f in findings if f["weak"]]
+    score = quantum_readiness_score(findings)
 
-    print("\n[3/4] Framework timeline grading (7 frameworks)...")
-    rows, score = grade_frameworks(findings, entries)
-    print(f"  Quantum Readiness Score: {score}/100")
-    print(f"  {'framework':<22} {'deploy_by':<9} {'weak':<5} status")
-    print("  " + "-" * 55)
-    for r in rows:
-        print(f"  {r['framework']:<22} {r['deploy_by']:<9} {r['weak_assets']:<5} {r['status']}")
+    banner = "=" * 62 + "\n  F5 - POST-QUANTUM CRYPTO SCANNER\n" + "=" * 62
+    lines = [banner,
+             "  Assets scanned      : %d" % len(configs),
+             "  Findings            : %d (weak: %d)" % (len(findings), len(weak)),
+             "  Quantum readiness   : %d/100" % score,
+             ""]
+    lines.append("  findings by asset:")
+    for f in findings:
+        mark = "[WEAK ]" if f["weak"] else "[OK   ]"
+        lines.append("    %s %-16s %-22s %s" %
+                     (mark, f["asset"], f["type"], f["detail"]))
+    text = "\n".join(lines)
 
-    print("\n[4/4] CycloneDX-ish CBOM JSON ...")
-    cbom = build_cbom(findings, entries, rows)
-    js = json.dumps(cbom, indent=2)
-    cbom_path = os.path.join(workdir, "cbom.json")
-    with open(cbom_path, "w", encoding="utf-8") as fh:
-        fh.write(js)
-    print(f"  wrote CBOM -> {cbom_path}")
-    print(f"  CBOM weak components: {len(cbom['components'])}")
+    out = Path(args.report)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if args.report.endswith(".json"):
+        out.write_text(json.dumps(
+            {"findings": findings, "weak": [f["asset"] for f in weak],
+             "score": score}, indent=2))
+    else:
+        out.write_text(text)
+    print(text)
 
-    print("\nFramework-divergence (which frameworks demand action by when):")
-    for r in rows:
-        if r["migrate_required"] and r["status"] == "at-risk":
-            print(f"    - {r['framework']}: migrate by {r['deploy_by']} -> target {r['target']}")
-
-    print("\nDemo complete (exit 0).")
-    return 0
+    # 0 = successful run, 1 = weak crypto present (--strict only), 2 = error.
+    return 1 if (weak and args.strict) else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main())
